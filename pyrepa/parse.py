@@ -1,87 +1,83 @@
-import ast
 import os
 import logging
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from pathlib import Path
 
+from pyrepa.errors import CantParseError
+from pyrepa.helpers import (
+    get_module_name,
+    iter_file_paths,
+    parse_ast,
+)
+from pyrepa.visitors import (
+    InitImportVisitor,
+    ImportVisitor,
+    CallVisitor,
+)
 
 logging.basicConfig(level=logging.INFO)
 
 
-def parse_one_file(file_path: str) -> List[Tuple[str, str]]:
-    logging.info(f"Parsing {file_path}")
-    with open(file_path, "r", encoding="utf-8") as file:
-        try:
-            tree = ast.parse(file.read(), filename=file_path)
-        except SyntaxError:
-            return []
+def collect_init_imports(
+    root_dir: Path,
+) -> Dict[str, str]:
 
-    logging.info(f"{tree=}")
+    init_imports = {}
+    for file_path in iter_file_paths(root_dir):
+        if file_path.split(os.sep)[-1] == "__init__.py":
 
+            try:
+                tree = parse_ast(file_path)
+            except CantParseError:
+                continue
+
+            visitor = InitImportVisitor(
+                module_name=get_module_name(file_path, root_dir),
+                init_imports=init_imports,
+            )
+            visitor.visit(tree)
+
+    return init_imports
+
+
+def parse_one_file(
+    file_path: str,
+    root_dir: Path,
+) -> List[Tuple[str, str]]:
+    try:
+        tree = parse_ast(file_path)
+    except CantParseError:
+        return []
+
+    module_name = get_module_name(file_path, root_dir)
+
+    import_visitor = ImportVisitor(
+        module_name=module_name,
+    )
+    import_visitor.visit(tree)
+
+    function_visitor = CallVisitor(
+        module_name=module_name,
+        import_map=import_visitor.import_map,
+    )
+    function_visitor.visit(tree)
+
+    return function_visitor.dependencies
+
+
+def collect_dependencies(
+    root_dir: Path,
+) -> List[Tuple[str, str]]:
     dependencies = []
-    import_map = {}
-
-    class ImportVisitor(ast.NodeVisitor):
-
-        def visit_Import(self, node: ast.Import):
-            for alias in node.names:
-                import_map[alias.asname or alias.name] = alias.name
-
-        def visit_ImportFrom(self, node: ast.ImportFrom):
-            module = node.module or ""
-            for alias in node.names:
-                full_name = f"{module}.{alias.name}".strip(".")
-                import_map[alias.asname or alias.name] = full_name
-
-    class FunctionVisitor(ast.NodeVisitor):
-
-        def __init__(self, current_module: str):
-            self.current_module = current_module
-            self.current_function = None
-
-        def visit_FunctionDef(self, node: ast.FunctionDef):
-            self.current_function = f"{self.current_module}.{node.name}"
-            self.generic_visit(node)
-            self.current_function = None
-
-        def visit_Call(self, node: ast.Call):
-
-            if self.current_function:
-
-                if isinstance(node.func, ast.Name):
-                    called_name = import_map.get(node.func.id, node.func.id)
-                    dependencies.append(
-                        (self.current_function, called_name)
-                    )
-
-                elif isinstance(node.func, ast.Attribute):
-                    value = node.func.value
-                    if isinstance(value, ast.Name):
-                        base_name = import_map.get(value.id, value.id)
-                        called_name = f"{base_name}.{node.func.attr}"
-                        dependencies.append(
-                            (self.current_function, called_name)
-                        )
-
-            self.generic_visit(node)
-
-    module_path = file_path.replace("/", ".").replace("\\", ".").rstrip(".py")
-    visitor = FunctionVisitor(current_module=module_path)
-    resolver = ImportVisitor()
-    resolver.visit(tree)
-    visitor.visit(tree)
+    for file_path in iter_file_paths(root_dir):
+        dependencies.extend(parse_one_file(file_path, root_dir))
     return dependencies
 
 
 def analyze_project(path: Path) -> List[Tuple[str, str]]:
-    dependencies = []
-    logging.info(f"Analyzing project at {path=}")
-    for root, _, files in os.walk(path):
-        logging.info(f"Analyzing {root=}, {files=}")
-        for file in files:
-            logging.info(f"Analyzing {file=}")
-            if file.endswith(".py"):
-                file_path = os.path.join(root, file)
-                dependencies.extend(parse_one_file(file_path))
+    init_imports = collect_init_imports(path)
+    dependencies = collect_dependencies(path)
+    for k, v in init_imports.items():
+        dependencies.append((k, v))
     return dependencies
